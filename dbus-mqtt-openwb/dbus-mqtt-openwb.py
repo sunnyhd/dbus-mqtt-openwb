@@ -5,6 +5,7 @@ import platform
 import logging
 import sys
 import os
+import json
 from time import sleep, time
 import paho.mqtt.client as mqtt
 import configparser  # for config/ini file
@@ -14,387 +15,223 @@ import _thread
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), 'ext', 'velib_python'))
 from vedbus import VeDbusService
 
-# get values from config.ini file
-try:
-    config_file = (os.path.dirname(os.path.realpath(__file__))) + "/config.ini"
-    if os.path.exists(config_file):
-        config = configparser.ConfigParser()
-        config.read(config_file)
-        if config['MQTT']['broker_address'] == "IP_ADDR_OR_FQDN":
-            print(
-                "ERROR:The \"config.ini\" is using invalid default values like IP_ADDR_OR_FQDN. The driver restarts "
-                "in 60 seconds.")
-            sleep(60)
-            sys.exit()
-    else:
-        print(
-            "ERROR:The \"" + config_file + "\" is not found. Did you copy or rename the \"config.sample.ini\" to "
-                                           "\"config.ini\"? The driver restarts in 60 seconds.")
-        sleep(60)
-        sys.exit()
-
-except Exception:
-    exception_type, exception_object, exception_traceback = sys.exc_info()
-    file = exception_traceback.tb_frame.f_code.co_filename
-    line = exception_traceback.tb_lineno
-    print(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
-    print("ERROR:The driver restarts in 60 seconds.")
+# --- Load configuration ---
+config_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'config.ini')
+if not os.path.exists(config_file):
+    print(f"ERROR: '{config_file}' not found. Did you copy config.sample.ini? Restarting in 60s.")
     sleep(60)
-    sys.exit()
+    sys.exit(1)
 
-# Get logging level from config.ini
-# ERROR = shows errors only
-# WARNING = shows ERROR and warnings
-# INFO = shows WARNING and running functions
-# DEBUG = shows INFO and data/values
-if 'DEFAULT' in config and 'logging' in config['DEFAULT']:
-    if config['DEFAULT']['logging'] == 'DEBUG':
-        logging.basicConfig(level=logging.DEBUG)
-    elif config['DEFAULT']['logging'] == 'INFO':
-        logging.basicConfig(level=logging.INFO)
-    elif config['DEFAULT']['logging'] == 'ERROR':
-        logging.basicConfig(level=logging.ERROR)
-    else:
-        logging.basicConfig(level=logging.WARNING)
-else:
-    logging.basicConfig(level=logging.WARNING)
+config = configparser.ConfigParser()
+config.read(config_file)
+if config['MQTT']['broker_address'] == 'IP_ADDR_OR_FQDN':
+    print("ERROR: Invalid broker address. Restarting in 60s.")
+    sleep(60)
+    sys.exit(1)
 
-# get timeout
-if 'DEFAULT' in config and 'timeout' in config['DEFAULT']:
-    timeout = int(config['DEFAULT']['timeout'])
-else:
-    timeout = 60
+# Logging
+loglevel = config.get('DEFAULT', 'logging', fallback='WARNING').upper()
+logging.basicConfig(level=getattr(logging, loglevel, logging.WARNING))
 
-# set variables
-connected = 0
-last_changed = 0
-last_updated = 0
-topic_prefix = ''
-vphase_packets = 0
-dbus_service = None
+# Globals
+timeout = int(config.get('DEFAULT', 'timeout', fallback='60'))
+last_changed = time()
 client = None
+dbus_service = None
 
-wb_power = -1
-wb_current = 0
-wb_forward = 0
-wb_plugstat = 0
-wb_chargestatus = 0
-# 0 = Sofort, 1 = MinPV, 2 = PV, 3 = Stop
-wb_chargemode = 3
-start_of_charge = -1
+# MQTT topic base and chargepoint ID for OpenWB 2.x
+topic_prefix = config['MQTT']['topic'].rstrip('#').rstrip('/')
+chargepoint_id = 5
+get_base = f"{topic_prefix}/chargepoint/{chargepoint_id}/get/"
 
-wb_voltages = [230, 230, 230]
-
-wb_L1_power = None
-wb_L1_current = None
-wb_L2_power = None
-wb_L2_current = None
-wb_L3_power = None
-wb_L3_current = None
-
-
-# MQTT requests
-def on_disconnect(lclient, userdata, rc):
-    global connected
-    logging.warning("MQTT client: Got disconnected")
-    if rc != 0:
-        logging.warning('MQTT client: Unexpected MQTT disconnection. Will auto-reconnect')
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        logging.info('MQTT connected to broker')
+        client.subscribe([(f"{topic_prefix}/chargepoint/{chargepoint_id}/get/#", 0),
+                          (f"{topic_prefix}/global/ChargeMode", 0)])
     else:
-        logging.warning('MQTT client: rc value:' + str(rc))
+        logging.error(f'MQTT connect failed, rc={rc}')
 
-    while connected == 0:
+
+def on_disconnect(client, userdata, rc):
+    logging.warning('MQTT disconnected')
+    while True:
         try:
-            logging.warning("MQTT client: Trying to reconnect")
-            lclient.connect(config['MQTT']['broker_address'])
-            connected = 1
-        except Exception as err:
-            logging.error(
-                f"MQTT client: Error in retrying to connect with broker ({config['MQTT']['broker_address']}:{config['MQTT']['broker_port']}): {err}")
-            logging.error("MQTT client: Retrying in 15 seconds")
-            connected = 0
+            client.reconnect()
+            logging.info('MQTT reconnected')
+            return
+        except Exception as e:
+            logging.error(f'Reconnect failed: {e}, retry in 15s')
             sleep(15)
 
 
-def on_connect(lclient, userdata, flags, rc):
-    global connected, topic_prefix
-    if rc == 0:
-        logging.info("MQTT client: Connected to MQTT broker!")
-        connected = 1
-        topic_prefix = config['MQTT']['topic']
-        lclient.subscribe([(topic_prefix, 0), ('openWB/global/ChargeMode', 0)])
-        if topic_prefix.endswith('#'):
-            topic_prefix = topic_prefix[:-1]
+def on_message(client, userdata, msg):
+    global last_changed, dbus_service
+    last_changed = time()
+    topic = msg.topic
+    payload = msg.payload.decode('utf-8', errors='ignore')
 
-    else:
-        logging.error("MQTT client: Failed to connect, return code %d\n", rc)
-
-
-def on_message(lclient, userdata, msg):
-    global dbus_service
-
-    if not dbus_service:
+    # Global ChargeMode -> /Mode
+    if topic == f"{topic_prefix}/global/ChargeMode":
+        try:
+            mode = int(payload)
+            # 2 = PV, else direct
+            dbus_service['/Mode'] = 1 if mode == 2 else 0
+        except ValueError:
+            logging.error(f'Cannot parse ChargeMode: {payload}')
         return
 
+    # Chargepoint data
+    if not topic.startswith(get_base) or not dbus_service:
+        return
+
+    key = topic[len(get_base):]
     try:
-        global \
-            last_changed, \
-            wb_power, wb_current, wb_voltages, wb_forward, wb_plugstat, \
-            wb_L1_power, wb_L1_current, \
-            wb_L2_power, wb_L2_current, \
-            wb_L3_power, wb_L3_current, \
-            vphase_packets, wb_chargestatus, wb_chargemode, start_of_charge
+        # simple numeric
+        if key == 'power':
+            dbus_service['/Ac/Power'] = float(payload)
 
-        topic = msg.topic
-        if topic.startswith(topic_prefix):
-            topic = topic[len(topic_prefix):]
-        if topic.startswith('VPhase'):
-            vphase_packets += 1
-            if topic == 'VPhase1':
-                wb_voltages[0] = float(msg.payload)
-            elif topic == 'VPhase2':
-                wb_voltages[1] = float(msg.payload)
-            elif topic == 'VPhase3':
-                wb_voltages[2] = float(msg.payload)
-                dbus_service['/Ac/Voltage'] = (wb_voltages[0] + wb_voltages[1] + wb_voltages[2]) / 3.0
-                dbus_service['/ChargingTime'] = time()-start_of_charge if start_of_charge else None
+        elif key == 'powers':
+            arr = json.loads(payload)
+            for i, v in enumerate(arr):
+                path = f'/Ac/L{i+1}/Power'
+                dbus_service[path] = float(v)
 
+        elif key == 'voltages':
+            arr = json.loads(payload)
+            avg = sum(arr) / len(arr)
+            dbus_service['/Ac/Voltage'] = avg
 
-        elif topic.startswith('APhase'):
-            if topic == 'APhase1':
-                wb_L1_current = float(msg.payload)
-                dbus_service['/Ac/L1/Power'] = wb_L1_current * wb_voltages[0]
-            elif topic == 'APhase2':
-                wb_L2_current = float(msg.payload)
-                dbus_service['/Ac/L2/Power'] = wb_L2_current * wb_voltages[1]
-            elif topic == 'APhase3':
-                wb_L3_current = float(msg.payload)
-                dbus_service['/Ac/L3/Power'] = wb_L3_current * wb_voltages[2]
+        elif key == 'daily_imported':
+            dbus_service['/Ac/Energy/Forward'] = float(payload)
 
-        elif topic == 'W':
-            wb_power_new = int(msg.payload)
-            if wb_power_new > 1000 and wb_power < 1000:
-                start_of_charge = time()
-            elif wb_power_new < 1000:
-                start_of_charge = None
-            dbus_service['/Ac/Power'] = wb_power_new
-            wb_power = wb_power_new
+        elif key == 'evse_current':  # EVSE charging current
+            dbus_service['/Current'] = float(payload)
 
-        #        elif topic == 'kWhCounter':
-        elif topic == 'kWhDailyCharged':
-            wb_forward_new = float(msg.payload)
-            if wb_forward_new != wb_forward:
-                dbus_service['/Ac/Energy/Forward'] = wb_forward_new
-            wb_forward = wb_forward_new
+        elif key == 'plug_state':
+            dbus_service['/Status'] = 2 if payload.lower() in ['true', '1'] else 0
 
-        elif topic == 'ChargeStatus' or topic == 'boolPlugStat':
-            if topic == 'boolPlugStat':
-                wb_plugstat = int(msg.payload)
-            elif topic == 'ChargeStatus':
-                wb_chargestatus = int(msg.payload)
-            if wb_chargestatus == 1:
-                dbus_service['/Status'] = 2
-            else:
-                dbus_service['/Status'] = wb_plugstat
+        elif key == 'charge_state':
+            # active charging -> /StartStop
+            dbus_service['/StartStop'] = 1 if payload.lower() in ['true','1'] else 0
 
-        elif topic == 'AConfigured':
-            dbus_service['/Current'] = int(msg.payload)
+        # add more mappings as needed...
 
-        elif topic == 'openWB/global/ChargeMode':
-            wb_chargemode = int(msg.payload)
-            dbus_service['/Mode'] = 1 if wb_chargemode == 2 else 0
-
-        if msg.payload != '' and msg.payload != b'' and not topic.startswith('VPhase'):
-            logging.debug("MQTT topic: " + topic + ", payload: " + str(msg.payload)[1:])
-
-    except ValueError as e:
-        logging.error("Received message is not a valid JSON. %s" % e)
-        logging.debug("MQTT payload: " + str(msg.payload)[1:])
-
-    except Exception:
-        exception_type, exception_object, exception_traceback = sys.exc_info()
-        file = exception_traceback.tb_frame.f_code.co_filename
-        line = exception_traceback.tb_lineno
-        logging.error(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
-        logging.debug("MQTT payload: " + str(msg.payload)[1:])
+    except Exception as e:
+        logging.error(f'Error handling {topic}: {e}')
 
 
-class DbusMqttWbService:
-    def __init__(
-            self,
-            servicename,
-            deviceinstance,
-            paths,
-            productname='MQTT OpenWB',
-            connection='MQTT OpenWB service'
-    ):
-
+class DbusMqttService:
+    def __init__(self, deviceinstance, paths):
         global dbus_service
-
-        self._dbusservice = VeDbusService(servicename)
-        self._paths = paths
-
-        logging.debug("%s /DeviceInstance = %d" % (servicename, deviceinstance))
-
-        paths_wo_unit = [
-            '/Status',
-            # value 'state' EVSE State - 1 Not Connected - 2 Connected - 3 Charging - 4 Error, 254 - sleep, 255 - disabled
-            # old_goecharger 1: charging station ready, no vehicle 2: vehicle loads 3: Waiting for vehicle 4: Charge finished, vehicle still connected
-        ]
-
-        # Create the management objects, as specified in the ccgx dbus-api document
-        self._dbusservice.add_path('/Mgmt/ProcessName', __file__)
-        self._dbusservice.add_path('/Mgmt/ProcessVersion',
-                                   'Unknown version, and running on Python ' + platform.python_version())
-        self._dbusservice.add_path('/Mgmt/Connection', connection)
-
-        # Create the mandatory objects
-        self._dbusservice.add_path('/DeviceInstance', deviceinstance)
-        self._dbusservice.add_path('/ProductId', 0xFFFF)  #
-        self._dbusservice.add_path('/ProductName', productname)
-        self._dbusservice.add_path('/CustomName', productname)
-        self._dbusservice.add_path('/FirmwareVersion', '0.9')
-        self._dbusservice.add_path('/HardwareVersion', 2)
-        self._dbusservice.add_path('/Connected', 1)
-        self._dbusservice.add_path('/UpdateIndex', 0)
-
-        # add paths without units
-        for path in paths_wo_unit:
-            self._dbusservice.add_path(path, None)
-
-        # add path values to dbus
-        for path, settings in self._paths.items():
-            self._dbusservice.add_path(
-                path, settings['initial'], gettextcallback=settings['textformat'], writeable=True,
-                onchangecallback=self._handlechangedvalue)
-
-        dbus_service = self._dbusservice
+        svc = VeDbusService(f'com.victronenergy.evcharger.mqtt_wb_{deviceinstance}')
+        # Management paths
+        svc.add_path('/Mgmt/ProcessName', __file__)
+        svc.add_path('/Mgmt/ProcessVersion', 'OpenWB2 Adapter')
+        svc.add_path('/Mgmt/Connection', 'MQTT↔DBus')
+        # Mandatory battery charger fields
+        svc.add_path('/DeviceInstance', deviceinstance)
+        svc.add_path('/ProductId', 0xFFFF)
+        svc.add_path('/ProductName', config['DEFAULT']['device_name'])
+        svc.add_path('/CustomName', config['DEFAULT']['device_name'])
+        svc.add_path('/FirmwareVersion', '2.x')
+        svc.add_path('/HardwareVersion', 2)
+        svc.add_path('/Connected', 1)
+        svc.add_path('/UpdateIndex', 0)
+        # Status path
+        svc.add_path('/Status', None)
+        # Add user DBus paths
+        for p, meta in paths.items():
+            svc.add_path(p, meta['initial'], gettextcallback=meta['textformat'], writeable=True,
+                         onchangecallback=self._on_dbus_change)
+        dbus_service = svc
+        # periodic update index and timeout check
+        GLib.timeout_add_seconds(1, self._update)
 
     def _update(self):
-
-        global \
-            last_changed, last_updated
-
-        now = int(time())
-
-        if last_changed != last_updated:
-            last_updated = last_changed
-
-            # quit driver if timeout is exceeded
-        if timeout != 0 and (now - last_changed) > timeout:
-            logging.error(
-                "Driver stopped. Timeout of %i seconds exceeded, since no new MQTT message was received in this time." % timeout)
-            sys.exit()
-
-            # increment UpdateIndex - to show that new data is available
-        index = self._dbusservice['/UpdateIndex'] + 1  # increment index
-        if index > 255:  # maximum value of the index
-            index = 0  # overflow from 255 to 0
-        self._dbusservice['/UpdateIndex'] = index
+        idx = dbus_service['/UpdateIndex'] + 1
+        dbus_service['/UpdateIndex'] = idx if idx <= 255 else 0
+        if timeout and (time() - last_changed) > timeout:
+            logging.error('MQTT timeout, exiting')
+            sys.exit(1)
         return True
 
-    def _handlechangedvalue(self, path, value):
-        if path == '/StartStop' and client:
-            if value == 0:
-                client.publish("openWB/set/ChargeMode", payload=3, qos=0, retain=False)
-            if value == 1:
-                client.publish("openWB/set/ChargeMode", payload=0, qos=0, retain=False)
-
-        if path == '/Mode' and client:
-            if value == 0:
-                client.publish("openWB/set/ChargeMode", payload=0, qos=0, retain=False)
-            if value == 1 and wb_chargemode != 2:
-                client.publish("openWB/set/ChargeMode", payload=2, qos=0, retain=False)
-            if value == 1 and wb_chargemode != 0:
-                client.publish("openWB/set/ChargeMode", payload=0, qos=0, retain=False)
-
-        if path == '/SetCurrent' and client:
-            client.publish("openWB/config/set/sofort/lp1/current", payload=value, qos=0, retain=False)
-
-        logging.debug("someone else updated %s to %s" % (path, value))
-        return True  # accept the change
+    def _on_dbus_change(self, path, value):
+        # Publish user-initiated DBus writes back to MQTT set topics
+        base = f"{topic_prefix}/chargepoint/{chargepoint_id}/set"
+        if not client:
+            return False
+        if path == '/StartStop':
+            topic = f"{base}/chargemode"
+            payload = 'instant_charging' if value else 'stop'
+        elif path == '/Mode':
+            topic = f"{base}/chargemode"
+            payload = 'pv_charging' if value == 1 else 'instant_charging'
+        elif path == '/SetCurrent':
+            topic = f"{base}/current"
+            payload = str(value)
+        else:
+            return False
+        client.publish(topic, payload)
+        return True
 
 
 def main():
     global client
-    _thread.daemon = True  # allow the program to quit
+    _thread.daemon = True
 
     from dbus.mainloop.glib import DBusGMainLoop  # pyright: ignore[reportMissingImports]
-    # Have a mainloop, so we can send/receive asynchronous calls to and from dbus
     DBusGMainLoop(set_as_default=True)
 
-    # formatting
-    _kwh = lambda p, v: (str(round(v, 2)) + 'kWh')
-    _a = lambda p, v: (str(round(v, 1)) + 'A')
-    _w = lambda p, v: (str(round(v, 1)) + 'W')
-    _v = lambda p, v: (str(round(v, 1)) + 'V')
-    _degC = lambda p, v: (str(v) + '°C')
-    _s = lambda p, v: (str(v) + 's')
-    _t = lambda p, v: (str(v))
-
-    paths_dbus = {
-        '/Ac/Power': {'initial': 0, 'textformat': _w},
-        '/Ac/L1/Power': {'initial': 0, 'textformat': _w},
-        '/Ac/L2/Power': {'initial': 0, 'textformat': _w},
-        '/Ac/L3/Power': {'initial': 0, 'textformat': _w},
-        '/Ac/Energy/Forward': {'initial': 0, 'textformat': _kwh},
-        '/ChargingTime': {'initial': 0, 'textformat': _s},
-
-        '/Ac/Voltage': {'initial': 0, 'textformat': _v},
-        '/Current': {'initial': 0, 'textformat': _a},
-        '/SetCurrent': {'initial': 0, 'textformat': _a},
-        '/MaxCurrent': {'initial': config['WALLBOX']['max'], 'textformat': _a},
-        '/MCU/Temperature': {'initial': 0, 'textformat': _degC},
-        '/Mode': {'initial': 0, 'textformat': _t},
-        '/Position': {'initial': int(config['WALLBOX']['position']), 'textformat': _t},
-        '/StartStop': {'initial': 0, 'textformat': _t}
+    # Define textformatters and DBus paths
+    fmt = {
+        'w': lambda v: f"{round(v,1)}W",
+        'a': lambda v: f"{round(v,1)}A",
+        'v': lambda v: f"{round(v,1)}V",
+        'kwh': lambda v: f"{round(v,2)}kWh",
+        's': lambda v: f"{v}s",
+        't': lambda v: str(v)
+    }
+    dbus_paths = {
+        '/Ac/Power':          {'initial': 0, 'textformat': fmt['w']},
+        '/Ac/L1/Power':       {'initial': 0, 'textformat': fmt['w']},
+        '/Ac/L2/Power':       {'initial': 0, 'textformat': fmt['w']},
+        '/Ac/L3/Power':       {'initial': 0, 'textformat': fmt['w']},
+        '/Ac/Energy/Forward': {'initial': 0, 'textformat': fmt['kwh']},
+        '/Ac/Voltage':        {'initial': 0, 'textformat': fmt['v']},
+        '/Current':           {'initial': 0, 'textformat': fmt['a']},
+        '/Mode':              {'initial': 0, 'textformat': fmt['t']},
+        '/StartStop':         {'initial': 0, 'textformat': fmt['t']},
+        '/SetCurrent':        {'initial': 0, 'textformat': fmt['a']},
+        '/MaxCurrent':        {'initial': int(config['WALLBOX']['max']), 'textformat': fmt['a']},
+        '/Ac/L1/Power':       {'initial': 0, 'textformat': fmt['w']},
+        '/Ac/L2/Power':       {'initial': 0, 'textformat': fmt['w']},
+        '/Ac/L3/Power':       {'initial': 0, 'textformat': fmt['w']}
     }
 
-    DbusMqttWbService(
-        servicename='com.victronenergy.evcharger.mqtt_wb_' + str(config['DEFAULT']['device_instance']),
-        deviceinstance=int(config['DEFAULT']['device_instance']),
-        productname=config['DEFAULT']['device_name'],
-        paths=paths_dbus
-    )
-    logging.info('Connected to dbus and switching over to GLib.MainLoop() (= event based)')
+    # Initialize DBus↔MQTT bridge
+    DbusMqttService(deviceinstance=int(config['DEFAULT']['device_instance']), paths=dbus_paths)
 
-    # MQTT setup
-    client = mqtt.Client("MqttOpenWB_" + str(config['DEFAULT']['device_instance']))
-    client.on_disconnect = on_disconnect
+    # Setup MQTT
+    client = mqtt.Client(f"MqttOpenWB_{config['DEFAULT']['device_instance']}")
     client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     client.on_message = on_message
 
-    # check tls and use settings, if provided
-    if 'tls_enabled' in config['MQTT'] and config['MQTT']['tls_enabled'] == '1':
-        logging.info("MQTT client: TLS is enabled")
-
-        if 'tls_path_to_ca' in config['MQTT'] and config['MQTT']['tls_path_to_ca'] != '':
-            logging.info("MQTT client: TLS: custom ca \"%s\" used" % config['MQTT']['tls_path_to_ca'])
-            client.tls_set(config['MQTT']['tls_path_to_ca'], tls_version=2)
-        else:
-            client.tls_set(tls_version=2)
-
-        if 'tls_insecure' in config['MQTT'] and config['MQTT']['tls_insecure'] != '':
-            logging.info("MQTT client: TLS certificate server hostname verification disabled")
+    if config['MQTT'].get('tls_enabled') == '1':
+        ca = config['MQTT'].get('tls_path_to_ca') or None
+        client.tls_set(ca)
+        if config['MQTT'].get('tls_insecure') == '1':
             client.tls_insecure_set(True)
+    if (user := config['MQTT'].get('username')):
+        client.username_pw_set(user, config['MQTT'].get('password',''))
 
-    # check if username and password are set
-    if 'username' in config['MQTT'] and 'password' in config['MQTT'] and config['MQTT']['username'] != '' and \
-            config['MQTT']['password'] != '':
-        logging.info("MQTT client: Using username \"%s\" and password to connect" % config['MQTT']['username'])
-        client.username_pw_set(username=config['MQTT']['username'], password=config['MQTT']['password'])
-
-    # connect to broker
-    logging.info(
-        f"MQTT client: Connecting to broker {config['MQTT']['broker_address']} on port {config['MQTT']['broker_port']}")
-    client.connect(
-        host=config['MQTT']['broker_address'],
-        port=int(config['MQTT']['broker_port'])
-    )
+    client.connect(config['MQTT']['broker_address'], int(config['MQTT']['broker_port']))
     client.loop_start()
 
-    mainloop = GLib.MainLoop()
-    mainloop.run()
+    # Run main loop
+    GLib.MainLoop().run()
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
+
