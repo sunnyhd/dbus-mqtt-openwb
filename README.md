@@ -31,8 +31,7 @@ Minimum requirement should be to adapt the IP address
     cd /tmp
 
     # download driver
-    wget -O /tmp/dbus-mqtt-openwb.zip https://github.com/gvzdus/dbus-mqtt-openwb/archive/refs/heads/master.zip
-
+    wget -O /tmp/dbus-mqtt-openwb.zip https://github.com/sunnyhd/dbus-mqtt-openwb/archive/refs/heads/master.zip
     # If updating: cleanup old folder
     rm -rf /tmp/dbus-mqtt-openwb-master
 
